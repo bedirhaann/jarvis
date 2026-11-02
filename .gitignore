@@ -1,0 +1,50 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+
+# ---- JARVIS runtime data (must never be committed) ----
+# The memory database lives in ~/.local/share/jarvis/, but guard against
+# accidental copies inside the repository as well.
+data/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+*.bak
+memory_export*.json
+
+# ---- Logs ----
+logs/
+*.log
+
+# ---- Local backups (full code snapshots; history is now kept in Git) ----
+backups/
+
+# ---- Secrets / local configuration ----
+.env
+.env.*
+*.pem
+*.key
+secrets/
+config/local*.toml
+config/*.local.*
+
+# ---- Editors / OS ----
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
