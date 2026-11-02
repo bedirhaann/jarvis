@@ -118,8 +118,14 @@ class JarvisOrb(QWidget):
     QUIT_POLL_INTERVAL_MS = 50
     QUIT_FALLBACK_TIMEOUT_MS = 10000
 
-    def __init__(self, start_worker: bool = True, chat_window: ChatWindow | None = None):
+    def __init__(
+        self,
+        start_worker: bool = True,
+        chat_window: ChatWindow | None = None,
+        app_context=None,
+    ):
         super().__init__()
+        self.app_context = app_context
 
         app = QApplication.instance()
         if app is not None:
@@ -170,7 +176,7 @@ class JarvisOrb(QWidget):
         self.chat_window = (
             chat_window
             if chat_window is not None
-            else ChatWindow(start_worker=start_worker)
+            else ChatWindow(start_worker=start_worker, app_context=app_context)
         )
         self.chat_window.state_changed.connect(self.set_state)
         self.chat_window.token_streamed.connect(self.on_token_streamed)

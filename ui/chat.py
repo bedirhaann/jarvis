@@ -1,3 +1,5 @@
+from typing import TYPE_CHECKING
+
 from PySide6.QtCore import Qt, Signal, QThread, Slot, QTimer
 from PySide6.QtWidgets import (
     QFrame,
@@ -12,8 +14,12 @@ from PySide6.QtWidgets import (
 )
 
 from services.antigravity_worker import AntigravityWorker
+from services.memory.service import MemoryService
 from ui.system_dashboard import SystemDashboardWidget
 from ui.widgets import BubbleRow, MessageBubble, ThinkingIndicator
+
+if TYPE_CHECKING:
+    from core.app_context import AppContext
 
 
 class ChatWindow(QWidget):
@@ -22,6 +28,7 @@ class ChatWindow(QWidget):
 
     message_requested = Signal(str)
     weather_refresh_requested = Signal()
+    conversation_reset_requested = Signal()
     shutdown_requested = Signal()
     state_changed = Signal(str)
     token_streamed = Signal()
@@ -29,9 +36,15 @@ class ChatWindow(QWidget):
 
     SCROLL_BOTTOM_THRESHOLD = 28
 
-    def __init__(self, start_worker: bool = True):
+    def __init__(
+        self,
+        start_worker: bool = True,
+        app_context: "AppContext | None" = None,
+        worker: AntigravityWorker | None = None,
+    ):
         super().__init__()
 
+        self.app_context = app_context
         self.setWindowTitle("JARVIS Assistant")
         self.setMinimumSize(450, 580)
         self.resize(500, 680)
@@ -54,13 +67,23 @@ class ChatWindow(QWidget):
 
         # Worker thread setup
         self.worker_thread = QThread(self)
-        self.worker = AntigravityWorker()
+        if worker is not None:
+            self.worker = worker
+        elif app_context is not None and app_context.memory_enabled:
+            db_path = app_context.db_path
+            self.worker = AntigravityWorker(
+                memory_service_factory=lambda: MemoryService(db_path=db_path)
+            )
+        else:
+            self.worker = AntigravityWorker()
         self.worker.moveToThread(self.worker_thread)
 
         self.worker_thread.started.connect(self.worker.initialize)
         self.message_requested.connect(self.worker.send_message)
         if hasattr(self.worker, "refresh_weather_badge"):
             self.weather_refresh_requested.connect(self.worker.refresh_weather_badge)
+        if hasattr(self.worker, "reset_conversation"):
+            self.conversation_reset_requested.connect(self.worker.reset_conversation)
 
         self.worker.ready.connect(self.on_ready)
         self.worker.token_received.connect(self.on_token)
@@ -75,6 +98,12 @@ class ChatWindow(QWidget):
             self.worker.shutdown_completed.connect(self._on_worker_shutdown_completed)
         if hasattr(self.worker, "weather_badge_updated"):
             self.worker.weather_badge_updated.connect(self.update_weather_badge)
+        if hasattr(self.worker, "memory_badge_updated"):
+            self.worker.memory_badge_updated.connect(self.update_memory_badge)
+        if hasattr(self.worker, "conversation_reset_completed"):
+            self.worker.conversation_reset_completed.connect(
+                self._on_conversation_reset_completed
+            )
 
         self.shutdown_requested.connect(self.worker.shutdown)
         self.worker_thread.finished.connect(self._on_thread_finished)
@@ -146,6 +175,20 @@ class ChatWindow(QWidget):
                 background-color: #163254;
                 color: #e0f2fe;
                 border-color: #38bdf8;
+            }
+            QPushButton#memoryButton {
+                background-color: #10243d;
+                border: 1px solid #1e3f66;
+                border-radius: 8px;
+                padding: 5px 10px;
+                color: #c084fc;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QPushButton#memoryButton:hover {
+                background-color: #1e1b4b;
+                color: #f3e8ff;
+                border-color: #a855f7;
             }
             QPushButton#clearButton {
                 background-color: #132036;
@@ -266,6 +309,13 @@ class ChatWindow(QWidget):
         self.system_button.setToolTip("Sistem İstihbarat Panelini Aç/Kapat")
         self.system_button.clicked.connect(self.toggle_system_dashboard)
         header_layout.addWidget(self.system_button)
+
+        self.memory_button = QPushButton("🧠 Hafıza")
+        self.memory_button.setObjectName("memoryButton")
+        self.memory_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.memory_button.setToolTip("Aktif hafıza kayıtlarını ve bekleyen önerileri göster")
+        self.memory_button.clicked.connect(self.request_memory_list)
+        header_layout.addWidget(self.memory_button)
 
         self.clear_button = QPushButton("Temizle")
         self.clear_button.setObjectName("clearButton")
@@ -418,6 +468,8 @@ class ChatWindow(QWidget):
         return list(self._bubbles)
 
     def clear_messages(self):
+        if self._shutting_down:
+            return
         self._active_assistant_bubble = None
         self._bubbles.clear()
         # Remove all BubbleRow items (keep thinking_indicator and stretch)
@@ -427,6 +479,9 @@ class ChatWindow(QWidget):
             if widget is not None:
                 widget.deleteLater()
         self._user_scrolled_up = False
+        self._set_status_badge("● NEW SESSION", "idle")
+        self.input.setPlaceholderText("Yeni konuşma başlatıldı — JARVIS'e bir mesaj yaz...")
+        self.conversation_reset_requested.emit()
 
     # ------------------------------------------------------------------
     # Status Badge Styling
@@ -457,6 +512,41 @@ class ChatWindow(QWidget):
         cleaned = (badge_text or "").strip()
         if hasattr(self, "weather_button") and self.weather_button is not None:
             self.weather_button.setText(cleaned if cleaned else "⛅ Hava")
+
+    @Slot(str)
+    def update_memory_badge(self, badge_text: str):
+        """Update header memory badge button text when worker emits memory_badge_updated."""
+        cleaned = (badge_text or "").strip()
+        if hasattr(self, "memory_button") and self.memory_button is not None:
+            self.memory_button.setText(cleaned if cleaned else "🧠 Hafıza")
+
+    @Slot()
+    def request_memory_list(self):
+        """Submit '/hafıza' command to list active memories and pending suggestions."""
+        if self._shutting_down:
+            return
+        if self.input.isEnabled() and not self.worker.is_busy():
+            self.input.setText("/hafıza")
+            self.send_message()
+
+    @Slot(int)
+    def _on_conversation_reset_completed(self, new_conv_id: int):
+        """Called when worker finishes resetting conversation & agy session."""
+        if self._shutting_down:
+            return
+        if new_conv_id > 0:
+            self.add_system_message(
+                f"Yeni konuşma başlatıldı (#{new_conv_id}). Önceki sohbet bağlamı sıfırlandı; genel ve proje hafızaları korunuyor."
+            )
+        else:
+            self.add_system_message(
+                "Yeni konuşma başlatıldı. Önceki sohbet oturumu sıfırlandı."
+            )
+        if not self.worker.is_busy():
+            self._set_status_badge("● NEW SESSION", "idle")
+            self.input.setEnabled(True)
+            self.send_button.setEnabled(True)
+            self.input.setFocus()
 
     @Slot()
     def request_weather_report(self):
@@ -605,7 +695,7 @@ class ChatWindow(QWidget):
         self.thinking_indicator.stop()
         self.input.setEnabled(False)
         self.send_button.setEnabled(False)
-        for btn_attr in ("weather_button", "system_button", "clear_button"):
+        for btn_attr in ("weather_button", "system_button", "memory_button", "clear_button"):
             btn = getattr(self, btn_attr, None)
             if btn is not None:
                 btn.setEnabled(False)

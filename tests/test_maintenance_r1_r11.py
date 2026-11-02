@@ -304,6 +304,7 @@ class TestR1OrbShutdown(unittest.TestCase):
                 **os.environ,
                 "QT_QPA_PLATFORM": "offscreen",
                 "PYTHONPATH": f"{tmpdir}:{PROJECT_ROOT}",
+                "JARVIS_DATA_DIR": os.path.join(tmpdir, "jarvis_data"),
             }
 
             for entry_script in (

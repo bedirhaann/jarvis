@@ -13,6 +13,7 @@ if PROJECT_ROOT not in sys.path:
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
+from core.app_context import AppContext
 from ui.orb import JarvisOrb
 
 
@@ -27,8 +28,9 @@ def create_application(argv: list[str] | None = None) -> QApplication:
 
 def main(argv: list[str] | None = None) -> int:
     app = create_application(argv)
+    app_context = AppContext.create_default()
 
-    orb = JarvisOrb(start_worker=True)
+    orb = JarvisOrb(start_worker=True, app_context=app_context)
     orb.show()
 
     # Periodic no-op timer so Python interpreter can process Unix signals while Qt loop runs
