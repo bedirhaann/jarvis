@@ -1,6 +1,7 @@
 import math
 import os
 import sys
+import time
 
 # Ensure project root is on sys.path when ui/orb.py is executed directly
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,6 +45,8 @@ class JarvisOrb(QWidget):
     drag/click handling, and right-click context menu."""
 
     state_updated = Signal(str)
+    shutdown_timeout_occurred = Signal(str)
+    shutdown_completed = Signal()
 
     VALID_STATES = {"connecting", "idle", "thinking", "responding", "error"}
     DRAG_THRESHOLD = 6
@@ -108,9 +111,12 @@ class JarvisOrb(QWidget):
         (76.0, 0.34, 0.78, 80),
     )
 
-    # Safety fallback timeout (ms); if the worker is still inside staged close
-    # when this fires, _finish_app_quit waits for worker_thread before app.quit().
-    QUIT_FALLBACK_TIMEOUT_MS = 4000
+    # Asynchronous shutdown coordination parameters:
+    # - Poll interval (ms) checks thread completion without blocking the GUI thread.
+    # - Default timeout (ms) covers AntigravityClient's full staged close window
+    #   (5s grace + 3s terminate + 1s kill = 9s, plus 1s margin = 10000 ms).
+    QUIT_POLL_INTERVAL_MS = 50
+    QUIT_FALLBACK_TIMEOUT_MS = 10000
 
     def __init__(self, start_worker: bool = True, chat_window: ChatWindow | None = None):
         super().__init__()
@@ -138,6 +144,11 @@ class JarvisOrb(QWidget):
         self._state = "connecting"
         self._token_energy = 0.0
         self._quitting = False
+        self._quit_completed = False
+        self._shutdown_state = "idle"  # "idle" | "stopping" | "timed_out" | "completed"
+        self._shutdown_started_at: float | None = None
+        self._shutdown_error: str | None = None
+        self.shutdown_timeout_ms: int = self.QUIT_FALLBACK_TIMEOUT_MS
 
         # Smoothly interpolated current colors
         init_core, init_mid, init_outer, init_accent, _, _, _ = self.STATE_PROFILES["connecting"]
@@ -167,6 +178,11 @@ class JarvisOrb(QWidget):
 
         # Context menu setup
         self.context_menu = self._build_context_menu()
+
+        # Non-blocking periodic shutdown monitor timer
+        self._shutdown_poll_timer = QTimer(self)
+        self._shutdown_poll_timer.setInterval(self.QUIT_POLL_INTERVAL_MS)
+        self._shutdown_poll_timer.timeout.connect(self._on_shutdown_poll_tick)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.animate)
@@ -277,8 +293,16 @@ class JarvisOrb(QWidget):
         )
         self.chat_window.move(target_x, target_y)
 
+    def shutdown_state(self) -> str:
+        return self._shutdown_state
+
+    def shutdown_error(self) -> str | None:
+        return self._shutdown_error
+
     @Slot()
     def toggle_chat_window(self):
+        if self._quitting:
+            return
         if self.chat_window.isVisible() and not self.chat_window.isMinimized():
             self.chat_window.hide()
         else:
@@ -291,40 +315,92 @@ class JarvisOrb(QWidget):
 
     @Slot()
     def clear_chat(self):
+        if self._quitting:
+            return
         self.chat_window.clear_messages()
 
     @Slot()
     def quit_application(self):
-        """Initiate non-blocking shutdown of worker and close application cleanly."""
+        """Initiate asynchronous, non-blocking shutdown of worker and close application
+        strictly after worker_thread and monitor_thread have genuinely exited."""
         if self._quitting:
             return
         self._quitting = True
         self._quit_completed = False
+        self._shutdown_state = "stopping"
+        self._shutdown_started_at = time.monotonic()
+        self._shutdown_error = None
+
         self.timer.stop()
+        for act_name in (
+            "action_toggle_chat",
+            "action_clear_chat",
+            "action_reset_corner",
+            "action_quit",
+        ):
+            act = getattr(self, act_name, None)
+            if act is not None:
+                act.setEnabled(False)
+
         self.chat_window.hide()
         self.hide()
 
         self.chat_window.request_shutdown()
-        if self.chat_window.is_shutdown_complete():
-            self._finish_app_quit()
-        else:
-            # Safety fallback timer after the full staged subprocess close window
-            QTimer.singleShot(self.QUIT_FALLBACK_TIMEOUT_MS, self._finish_app_quit)
+        if not self._try_complete_quit():
+            self._shutdown_poll_timer.start()
 
     @Slot()
     def _on_chat_shutdown_finished(self):
         if self._quitting:
-            self._finish_app_quit()
+            self._try_complete_quit()
 
-    def _finish_app_quit(self):
-        if getattr(self, "_quit_completed", False):
+    @Slot()
+    def _on_shutdown_poll_tick(self):
+        if not self._quitting or self._quit_completed:
+            self._shutdown_poll_timer.stop()
             return
+
+        if self._try_complete_quit():
+            return
+
+        started = self._shutdown_started_at or time.monotonic()
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+
+        if elapsed_ms >= self.shutdown_timeout_ms and self._shutdown_state == "stopping":
+            self._shutdown_state = "timed_out"
+            self._shutdown_error = (
+                f"JARVIS shutdown timed out after {int(elapsed_ms)} ms; "
+                "escalating worker abort and awaiting QThread termination."
+            )
+            sys.stderr.write(self._shutdown_error + "\n")
+            self.shutdown_timeout_occurred.emit(self._shutdown_error)
+            self.chat_window.escalate_shutdown()
+            # Re-check immediately in case escalation unblocked the thread
+            self._try_complete_quit()
+        elif self._shutdown_state == "timed_out":
+            self.chat_window.escalate_shutdown()
+            self._try_complete_quit()
+
+    def _try_complete_quit(self) -> bool:
+        """Verify via QThread.wait() return values that all background threads have
+        stopped before transitioning to 'completed' and calling app.quit()."""
+        if self._quit_completed:
+            return True
+        if not self.chat_window.verify_threads_stopped(wait_ms=20):
+            return False
+
         self._quit_completed = True
-        if self.chat_window.worker_thread.isRunning():
-            self.chat_window.worker_thread.wait(6000)
+        self._shutdown_state = "completed"
+        self._shutdown_poll_timer.stop()
+        self.shutdown_completed.emit()
         app = QApplication.instance()
         if app is not None:
             app.quit()
+        return True
+
+    def _finish_app_quit(self):
+        """Backward-compatible helper that delegates to _try_complete_quit()."""
+        self._try_complete_quit()
 
     # ------------------------------------------------------------------
     # Context Menu

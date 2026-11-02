@@ -31,11 +31,25 @@ def main(argv: list[str] | None = None) -> int:
     orb = JarvisOrb(start_worker=True)
     orb.show()
 
+    # Periodic no-op timer so Python interpreter can process Unix signals while Qt loop runs
+    sig_timer = QTimer()
+    sig_timer.start(250)
+    sig_timer.timeout.connect(lambda: None)
+
     def _on_about_to_quit():
+        """Final safety net when event loop exits. Primary shutdown coordination is
+        performed asynchronously inside orb.quit_application() BEFORE app.quit()."""
+        sig_timer.stop()
         orb.timer.stop()
+        if orb.chat_window.verify_threads_stopped(wait_ms=20):
+            return
         orb.chat_window.request_shutdown()
-        if orb.chat_window.worker_thread.isRunning():
-            orb.chat_window.worker_thread.wait(4000)
+        if not orb.chat_window.verify_threads_stopped(wait_ms=10000):
+            orb.chat_window.escalate_shutdown()
+            if not orb.chat_window.verify_threads_stopped(wait_ms=2000):
+                sys.stderr.write(
+                    "JARVIS error: background worker thread did not stop within aboutToQuit window.\n"
+                )
 
     app.aboutToQuit.connect(_on_about_to_quit)
 
@@ -45,11 +59,6 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGINT, _handle_unix_signal)
     signal.signal(signal.SIGTERM, _handle_unix_signal)
-
-    # Periodic no-op timer so Python interpreter can process Unix signals while Qt loop runs
-    sig_timer = QTimer()
-    sig_timer.start(250)
-    sig_timer.timeout.connect(lambda: None)
 
     return app.exec()
 

@@ -500,8 +500,8 @@ class SystemDashboardWidget(QFrame):
         if not self._shutting_down and self.monitor_worker.is_active():
             self.sample_requested.emit()
 
-    def shutdown(self):
-        """Cleanly stop polling and terminate background monitor QThread."""
+    def request_shutdown(self):
+        """Non-blocking shutdown request for the dashboard monitor thread."""
         if self._shutting_down:
             return
         self._shutting_down = True
@@ -509,7 +509,14 @@ class SystemDashboardWidget(QFrame):
         self.monitor_worker.request_stop()
         if self.monitor_thread.isRunning():
             self.monitor_thread.quit()
-            self.monitor_thread.wait(2000)
+
+    def shutdown(self) -> bool:
+        """Cleanly stop polling and terminate background monitor QThread.
+        Returns True when monitor_thread has fully stopped."""
+        self.request_shutdown()
+        if self.monitor_thread.isRunning():
+            return bool(self.monitor_thread.wait(2000))
+        return True
 
     # ------------------------------------------------------------------
     # UI Update Slot

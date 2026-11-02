@@ -41,6 +41,7 @@ class AntigravityWorker(QObject):
         self._stopping = threading.Event()
         self._shutdown_done = False
         self._first_token_seen = False
+        self._closing_client: AntigravityClient | None = None
         self.executed_qthreads: deque[QThread] = deque(maxlen=self.QTHREAD_HISTORY_LIMIT)
 
     @staticmethod
@@ -60,9 +61,34 @@ class AntigravityWorker(QObject):
         Only sets stop/cancel flags; subprocess cleanup happens on the worker thread."""
         self._stopping.set()
         with self._lock:
-            client = self.client
+            client = self.client or self._closing_client
         if client is not None:
             client.request_close()
+
+    def force_abort_client(self):
+        """Emergency non-blocking escalation called if worker shutdown exceeds the
+        staged timeout window. Signals force_abort/SIGKILL on any lingering client
+        subprocess so the blocked worker thread can unwind and exit cleanly."""
+        self._stopping.set()
+        with self._lock:
+            client = self.client or self._closing_client
+        if client is None:
+            return
+        try:
+            client.request_close()
+        except Exception:
+            pass
+        if hasattr(client, "force_abort") and callable(client.force_abort):
+            try:
+                client.force_abort()
+            except Exception:
+                pass
+        proc = getattr(client, "process", None)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
 
     def _ensure_healthy_client(self):
         """Ensure client exists and its subprocess is healthy.
@@ -122,11 +148,16 @@ class AntigravityWorker(QObject):
             if not self._stopping.is_set():
                 self.state_changed.emit("error")
                 self.error_occurred.emit(str(error))
+        finally:
+            if self._stopping.is_set() and not self.is_busy():
+                self._finalize_shutdown()
 
     @Slot()
     def refresh_weather_badge(self):
         self._record_current_qthread()
         if self._stopping.is_set() or self.weather_service is None:
+            if self._stopping.is_set() and not self.is_busy():
+                self._finalize_shutdown()
             return
         try:
             snapshot = self.weather_service.fetch_weather("")
@@ -134,6 +165,9 @@ class AntigravityWorker(QObject):
                 self.weather_badge_updated.emit(snapshot.format_badge())
         except Exception:
             pass
+        finally:
+            if self._stopping.is_set() and not self.is_busy():
+                self._finalize_shutdown()
 
     @Slot(str)
     def send_message(self, message: str):
@@ -240,12 +274,17 @@ class AntigravityWorker(QObject):
         with self._lock:
             client = self.client
             self.client = None
+            self._closing_client = client
 
         if client is not None:
             try:
                 client.close()
             except Exception:
                 pass
+            finally:
+                with self._lock:
+                    if self._closing_client is client:
+                        self._closing_client = None
 
     def _finalize_shutdown(self):
         with self._lock:

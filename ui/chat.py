@@ -78,6 +78,8 @@ class ChatWindow(QWidget):
 
         self.shutdown_requested.connect(self.worker.shutdown)
         self.worker_thread.finished.connect(self._on_thread_finished)
+        if hasattr(self, "system_dashboard") and self.system_dashboard is not None:
+            self.system_dashboard.monitor_thread.finished.connect(self._on_thread_finished)
 
         if start_worker:
             self.worker_thread.start()
@@ -603,11 +605,15 @@ class ChatWindow(QWidget):
         self.thinking_indicator.stop()
         self.input.setEnabled(False)
         self.send_button.setEnabled(False)
+        for btn_attr in ("weather_button", "system_button", "clear_button"):
+            btn = getattr(self, btn_attr, None)
+            if btn is not None:
+                btn.setEnabled(False)
 
         if hasattr(self, "system_dashboard") and self.system_dashboard is not None:
-            self.system_dashboard.shutdown()
+            self.system_dashboard.request_shutdown()
 
-        if not self.worker_thread.isRunning():
+        if self.verify_threads_stopped(wait_ms=0):
             self._shutdown_complete = True
             self.shutdown_finished.emit()
             return
@@ -615,7 +621,35 @@ class ChatWindow(QWidget):
         if hasattr(self.worker, "request_stop"):
             self.worker.request_stop()
 
-        self.shutdown_requested.emit()
+        if self.worker_thread.isRunning():
+            self.shutdown_requested.emit()
+
+    def escalate_shutdown(self):
+        """Controlled escalation when worker shutdown exceeds its timeout window.
+        Forces lingering client subprocesses to abort so the worker thread can unwind."""
+        if hasattr(self, "system_dashboard") and self.system_dashboard is not None:
+            self.system_dashboard.request_shutdown()
+        if hasattr(self.worker, "force_abort_client"):
+            self.worker.force_abort_client()
+        elif hasattr(self.worker, "request_stop"):
+            self.worker.request_stop()
+        if self.worker_thread.isRunning() and not self.worker.is_busy():
+            self.worker_thread.quit()
+
+    def verify_threads_stopped(self, wait_ms: int = 0) -> bool:
+        """Return True only when both worker_thread and monitor_thread have
+        genuinely exited, checking the bool return value of QThread.wait()."""
+        bound_ms = max(0, int(wait_ms))
+        if self.worker_thread.isRunning():
+            if not self.worker_thread.wait(bound_ms):
+                return False
+        if hasattr(self, "system_dashboard") and self.system_dashboard is not None:
+            mon_thread = self.system_dashboard.monitor_thread
+            if mon_thread.isRunning():
+                if not mon_thread.wait(bound_ms):
+                    return False
+        self._shutdown_complete = True
+        return True
 
     @Slot()
     def _on_worker_shutdown_completed(self):
@@ -624,11 +658,14 @@ class ChatWindow(QWidget):
 
     @Slot()
     def _on_thread_finished(self):
-        self._shutdown_complete = True
-        self.shutdown_finished.emit()
+        if self._shutdown_complete:
+            return
+        if self.verify_threads_stopped(wait_ms=20):
+            self._shutdown_complete = True
+            self.shutdown_finished.emit()
 
     def is_shutdown_complete(self) -> bool:
-        return self._shutdown_complete or not self.worker_thread.isRunning()
+        return self.verify_threads_stopped(wait_ms=0)
 
     def shutdown(self):
         """Initiate non-blocking shutdown (kept compatible with orb.py aboutToQuit)."""
