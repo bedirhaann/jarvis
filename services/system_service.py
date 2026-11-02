@@ -263,12 +263,14 @@ class SystemMonitorService:
         procfs_root: str | Path = "/proc",
         command_runner: Callable[[list[str], float], str | None] | None = None,
         command_timeout: float = 2.0,
+        monotonic_clock: Callable[[], float] | None = None,
     ):
         self.history_maxlen = max(10, history_maxlen)
         self.sysfs_root = Path(sysfs_root)
         self.procfs_root = Path(procfs_root)
         self.command_timeout = command_timeout
         self._command_runner = command_runner or self._default_command_runner
+        self._monotonic_clock = monotonic_clock or time.monotonic
 
         # Delta sampling state for CPU and Network
         self._cpu_primed = False
@@ -685,8 +687,8 @@ class SystemMonitorService:
             percent=round(pct, 1),
         )
 
-    def _collect_network_metrics(self) -> NetworkMetrics:
-        now = time.monotonic()
+    def _collect_network_metrics(self, now_monotonic: float | None = None) -> NetworkMetrics:
+        now = float(now_monotonic) if now_monotonic is not None else float(self._monotonic_clock())
         active_ifaces: list[str] = []
         rx_bytes = 0
         tx_bytes = 0

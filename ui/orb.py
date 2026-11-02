@@ -1,5 +1,11 @@
 import math
+import os
 import sys
+
+# Ensure project root is on sys.path when ui/orb.py is executed directly
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import (
@@ -102,8 +108,16 @@ class JarvisOrb(QWidget):
         (76.0, 0.34, 0.78, 80),
     )
 
+    # Safety fallback timeout (ms); if the worker is still inside staged close
+    # when this fires, _finish_app_quit waits for worker_thread before app.quit().
+    QUIT_FALLBACK_TIMEOUT_MS = 4000
+
     def __init__(self, start_worker: bool = True, chat_window: ChatWindow | None = None):
         super().__init__()
+
+        app = QApplication.instance()
+        if app is not None:
+            app.setQuitOnLastWindowClosed(False)
 
         self.setWindowTitle("JARVIS")
         self.setFixedSize(self.ORB_WINDOW_SIZE, self.ORB_WINDOW_SIZE)
@@ -285,6 +299,7 @@ class JarvisOrb(QWidget):
         if self._quitting:
             return
         self._quitting = True
+        self._quit_completed = False
         self.timer.stop()
         self.chat_window.hide()
         self.hide()
@@ -293,8 +308,8 @@ class JarvisOrb(QWidget):
         if self.chat_window.is_shutdown_complete():
             self._finish_app_quit()
         else:
-            # Safety fallback timer in case event loop needs a final nudge
-            QTimer.singleShot(4000, self._finish_app_quit)
+            # Safety fallback timer after the full staged subprocess close window
+            QTimer.singleShot(self.QUIT_FALLBACK_TIMEOUT_MS, self._finish_app_quit)
 
     @Slot()
     def _on_chat_shutdown_finished(self):
@@ -302,6 +317,11 @@ class JarvisOrb(QWidget):
             self._finish_app_quit()
 
     def _finish_app_quit(self):
+        if getattr(self, "_quit_completed", False):
+            return
+        self._quit_completed = True
+        if self.chat_window.worker_thread.isRunning():
+            self.chat_window.worker_thread.wait(6000)
         app = QApplication.instance()
         if app is not None:
             app.quit()
@@ -679,12 +699,13 @@ class JarvisOrb(QWidget):
             super().mouseReleaseEvent(event)
 
 
+def _run_standalone(argv: list[str] | None = None) -> int:
+    """Delegate direct `python ui/orb.py` / `python -m ui.orb` execution to main.main()
+    so the application always uses the same safe lifecycle and signal handlers."""
+    from main import main
+
+    return main(argv)
+
+
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-
-    orb = JarvisOrb()
-    orb.show()
-
-    app.aboutToQuit.connect(orb.chat_window.shutdown)
-
-    sys.exit(app.exec())
+    sys.exit(_run_standalone())

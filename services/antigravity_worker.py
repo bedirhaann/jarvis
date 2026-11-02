@@ -1,5 +1,6 @@
 import os
 import threading
+from collections import deque
 
 from PySide6.QtCore import QCoreApplication, QObject, Signal, Slot, QThread
 
@@ -9,6 +10,8 @@ from services.weather_service import WeatherService
 
 
 class AntigravityWorker(QObject):
+    QTHREAD_HISTORY_LIMIT = 64
+
     ready = Signal()
     state_changed = Signal(str)
     thinking_started = Signal()
@@ -38,7 +41,7 @@ class AntigravityWorker(QObject):
         self._stopping = threading.Event()
         self._shutdown_done = False
         self._first_token_seen = False
-        self.executed_qthreads: list[QThread] = []
+        self.executed_qthreads: deque[QThread] = deque(maxlen=self.QTHREAD_HISTORY_LIMIT)
 
     @staticmethod
     def _default_client_factory() -> AntigravityClient:

@@ -12,7 +12,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from PySide6.QtCore import QEventLoop, QObject, QTimer, Signal, Slot
+from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
@@ -21,6 +21,7 @@ from services.system_service import (
     DiskMetrics,
     GpuMetrics,
     MemoryMetrics,
+    ProcessItem,
     SystemMonitorService,
 )
 from ui.chat import ChatWindow
@@ -38,43 +39,6 @@ def _pump_events(ms: int = 80):
     loop = QEventLoop()
     QTimer.singleShot(ms, loop.quit)
     loop.exec()
-
-
-class _DummyWorker(QObject):
-    """Minimal worker stub for testing ChatWindow + SystemDashboardWidget without subprocesses."""
-
-    token_received = Signal(str)
-    response_finished = Signal()
-    error_occurred = Signal(str)
-    ready = Signal()
-    weather_badge_updated = Signal(str)
-    shutdown_completed = Signal()
-
-    def __init__(self):
-        super().__init__()
-
-    @Slot()
-    def initialize_client(self):
-        self.ready.emit()
-
-    @Slot(str)
-    def process_message(self, text: str):
-        self.token_received.emit(f"Mock yanıt: {text}")
-        self.response_finished.emit()
-
-    @Slot()
-    def refresh_weather_badge(self):
-        self.weather_badge_updated.emit("⛅ 22°C")
-
-    @Slot()
-    def shutdown(self):
-        self.shutdown_completed.emit()
-
-    def request_stop(self):
-        pass
-
-    def is_busy(self) -> bool:
-        return False
 
 
 class TestStage7SystemIntelligence(unittest.TestCase):
@@ -225,8 +189,9 @@ class TestStage7SystemIntelligence(unittest.TestCase):
         self.assertTrue(cpu2.is_primed)
         self.assertIsNotNone(cpu2.usage_percent)
 
-        # Network delta verification
-        svc_net = SystemMonitorService()
+        # Network delta verification (using instance-scoped monotonic clock, never patching global time.monotonic)
+        fake_timestamps = iter([100.0, 102.0, 104.0])
+        svc_net = SystemMonitorService(monotonic_clock=lambda: next(fake_timestamps))
         fake_stats = {"wlan0": SimpleNamespace(isup=True)}
         c1 = {"wlan0": SimpleNamespace(bytes_recv=100_000, bytes_sent=50_000)}
         c2 = {"wlan0": SimpleNamespace(bytes_recv=151_200, bytes_sent=75_600)}  # +50 KB RX, +25 KB TX
@@ -234,7 +199,7 @@ class TestStage7SystemIntelligence(unittest.TestCase):
 
         with patch("psutil.net_if_stats", return_value=fake_stats), patch(
             "psutil.net_io_counters", side_effect=[c1, c2, c3_reset]
-        ), patch("time.monotonic", side_effect=[100.0, 102.0, 104.0]):
+        ):
             net1 = svc_net._collect_network_metrics()
             self.assertFalse(net1.is_rate_primed)
             self.assertIsNone(net1.rx_rate_kbps)
@@ -313,7 +278,13 @@ class TestStage7SystemIntelligence(unittest.TestCase):
 
     def test_6_history_graphs_and_dashboard_thread_lifecycle(self):
         """60-second history deque, SparklineGraphWidget rendering, and SystemDashboardWidget thread start/stop/restart/shutdown."""
-        svc = SystemMonitorService(history_maxlen=30)
+        fake_gpu_line = (
+            "NVIDIA GeForce RTX 4060 Laptop GPU, 14, 42, 640, 8188, 15.0, [N/A], 45.0, 80.0, [N/A]\n"
+        )
+        svc = SystemMonitorService(
+            history_maxlen=30,
+            command_runner=lambda _args, _t: fake_gpu_line,
+        )
         snap1 = svc.collect_snapshot(prime_cpu_if_needed=False)
         snap2 = svc.collect_snapshot(prime_cpu_if_needed=False)
         self.assertGreaterEqual(len(snap2.history.cpu_percent), 1)
@@ -328,8 +299,9 @@ class TestStage7SystemIntelligence(unittest.TestCase):
         graph.render(img)
         self.assertFalse(img.isNull())
 
-        # Test ChatWindow + SystemDashboardWidget lifecycle
+        # Test ChatWindow + SystemDashboardWidget lifecycle with isolated command_runner
         chat = ChatWindow(start_worker=False)
+        chat.system_dashboard.service._command_runner = lambda _args, _t: fake_gpu_line
         try:
             self.assertTrue(chat.system_dashboard.isHidden())
             self.assertFalse(chat.system_dashboard.is_monitoring_active())
@@ -366,7 +338,8 @@ class TestStage7SystemIntelligence(unittest.TestCase):
             chat.close()
 
     def test_7_worker_system_report_command_and_natural_language(self):
-        """AntigravityWorker intercepts '/sistem' and natural language system queries without calling LLM."""
+        """AntigravityWorker intercepts '/sistem' and natural language system queries
+        without calling LLM or spawning real hardware subprocesses."""
         from services.antigravity_worker import AntigravityWorker
 
         self.assertTrue(SystemMonitorService.is_system_query("/sistem"))
@@ -374,18 +347,54 @@ class TestStage7SystemIntelligence(unittest.TestCase):
         self.assertTrue(SystemMonitorService.is_system_query("gpu sıcaklığı kaç derece"))
         self.assertFalse(SystemMonitorService.is_system_query("Python ile sistem durumu özelliğini kodla"))
 
-        worker = AntigravityWorker(client_factory=lambda: None)
-        tokens: list[str] = []
-        finished: list[bool] = []
-        worker.token_received.connect(tokens.append)
-        worker.response_finished.connect(lambda: finished.append(True))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sysfs = Path(tmpdir)
+            hwmon = sysfs / "class" / "hwmon" / "hwmon0"
+            hwmon.mkdir(parents=True)
+            (hwmon / "name").write_text("coretemp\n", encoding="utf-8")
+            (hwmon / "temp1_input").write_text("48000\n", encoding="utf-8")
+            (hwmon / "temp1_label").write_text("Package id 0\n", encoding="utf-8")
 
-        worker.send_message("/sistem")
-        self.assertEqual(len(finished), 1)
-        full_md = "".join(tokens)
-        self.assertIn("JARVIS Sistem İstihbarat Raporu", full_md)
-        self.assertIn("Genel Sağlık Durumu:", full_md)
-        self.assertIn("İşlemci (CPU):", full_md)
+            bat = sysfs / "class" / "power_supply" / "BAT0"
+            bat.mkdir(parents=True)
+            (bat / "type").write_text("Battery\n", encoding="utf-8")
+            (bat / "capacity").write_text("76\n", encoding="utf-8")
+            (bat / "status").write_text("Discharging\n", encoding="utf-8")
+
+            fake_gpu_out = (
+                "NVIDIA GeForce RTX 4060 Laptop GPU, 22, 44, 920, 8188, "
+                "18.50, [N/A], 45.00, 80.00, [N/A]\n"
+            )
+            isolated_sys_service = SystemMonitorService(
+                sysfs_root=sysfs,
+                command_runner=lambda _args, _t: fake_gpu_out,
+            )
+
+            with patch.object(
+                isolated_sys_service,
+                "_collect_top_processes",
+                return_value=[ProcessItem(pid=1234, name="python3", cpu_percent=4.2, memory_mb=128.5)],
+            ), patch("psutil.cpu_percent", return_value=18.5):
+                worker = AntigravityWorker(
+                    client_factory=lambda: (_ for _ in ()).throw(
+                        AssertionError("LLM client must not be started for /sistem")
+                    ),
+                    system_service=isolated_sys_service,
+                )
+                tokens: list[str] = []
+                finished: list[bool] = []
+                worker.token_received.connect(tokens.append)
+                worker.response_finished.connect(lambda: finished.append(True))
+
+                worker.send_message("/sistem")
+                self.assertEqual(len(finished), 1)
+                full_md = "".join(tokens)
+                self.assertIn("JARVIS Sistem İstihbarat Raporu", full_md)
+                self.assertIn("Genel Sağlık Durumu:", full_md)
+                self.assertIn("İşlemci (CPU):", full_md)
+                self.assertIn("48.0°C", full_md)
+                self.assertIn("RTX 4060 Laptop GPU", full_md)
+                self.assertIn("BAT0", full_md)
 
 
 if __name__ == "__main__":
